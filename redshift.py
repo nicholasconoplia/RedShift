@@ -583,7 +583,7 @@ class RedShiftApp:
         def enum_monitor_proc(
             hmonitor: ctypes.c_void_p,
             hdc_monitor: ctypes.c_void_p,
-            rect: ctypes.POINTER(object),
+            rect: ctypes.c_void_p,
             data: ctypes.c_void_p,
         ) -> int:
             del hdc_monitor, rect, data
