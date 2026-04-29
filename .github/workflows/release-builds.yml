@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 jobs:
   build:
@@ -12,8 +14,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - os: macos-13
+            artifact_name: RedShift-macos-x64
           - os: macos-14
-            artifact_name: RedShift-macos-universal
+            artifact_name: RedShift-macos-arm64
           - os: windows-latest
             artifact_name: RedShift-windows-x64
 
@@ -68,7 +72,8 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            artifacts/RedShift-macos-universal/RedShift-macos-universal.zip
+            artifacts/RedShift-macos-arm64/RedShift-macos-arm64.zip
+            artifacts/RedShift-macos-x64/RedShift-macos-x64.zip
             artifacts/RedShift-windows-x64/RedShift-windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
