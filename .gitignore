@@ -8,3 +8,7 @@ __pycache__/
 build/
 dist/
 assets/
+venv/
+dist/
+build/
+*.spec
