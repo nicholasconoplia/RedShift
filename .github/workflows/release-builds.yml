@@ -48,5 +48,30 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/*.zip
+            name: ${{ matrix.artifact_name }}
+            path: dist/${{ matrix.artifact_name }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: RedShift v1.0.0
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/RedShift-macos-arm64/RedShift-macos-arm64.zip
+            artifacts/RedShift-macos-x64/RedShift-macos-x64.zip
+            artifacts/RedShift-windows-x64/RedShift-windows-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
