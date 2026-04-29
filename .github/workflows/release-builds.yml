@@ -9,13 +9,12 @@ on:
       - "v*"
 
 jobs:
-  build:
+  # Job 1: Fast builds (Silicon Mac & Windows)
+  build-fast:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
-            artifact_name: RedShift-macos-x64
           - os: macos-14
             artifact_name: RedShift-macos-arm64
           - os: windows-latest
@@ -25,55 +24,89 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt -r requirements-build.txt
-
       - name: Build app
         run: python build_release.py
-
       - name: Archive macOS app
         if: runner.os == 'macOS'
         run: ditto -c -k --keepParent dist/RedShift.app dist/${{ matrix.artifact_name }}.zip
-
       - name: Archive Windows app
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path dist/RedShift/* -DestinationPath dist/${{ matrix.artifact_name }}.zip
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-            name: ${{ matrix.artifact_name }}
-            path: dist/${{ matrix.artifact_name }}.zip
+          name: ${{ matrix.artifact_name }}
+          path: dist/*.zip
 
-  release:
-    needs: build
+  # Job 2: Create Initial Release (Depends only on fast builds)
+  create-release:
+    needs: build-fast
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Create Release
+      - name: Create/Update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.0
-          name: RedShift v1.0.0
+          tag_name: v1.0.2
+          name: RedShift v1.0.2
           draft: false
           prerelease: false
           files: |
             artifacts/RedShift-macos-arm64/RedShift-macos-arm64.zip
-            artifacts/RedShift-macos-x64/RedShift-macos-x64.zip
             artifacts/RedShift-windows-x64/RedShift-windows-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Job 3: Slow build (Intel Mac) - Runs in parallel but updates later
+  build-intel:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Build app
+        run: python build_release.py
+      - name: Archive macOS app
+        run: ditto -c -k --keepParent dist/RedShift.app dist/RedShift-macos-x64.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RedShift-macos-x64
+          path: dist/*.zip
+
+  # Job 4: Add Intel build to Release (Depends on Intel build AND Release job)
+  update-release-intel:
+    needs: [build-intel, create-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Intel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: RedShift-macos-x64
+      - name: Update Release with Intel build
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.2
+          files: RedShift-macos-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
