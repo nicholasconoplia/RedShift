@@ -3,11 +3,13 @@ import atexit
 import ctypes
 import json
 import logging
+import os
+import queue
 import sys
 import threading
 import traceback
 from pathlib import Path
-from typing import List
+from typing import Callable, List
 
 import pystray
 import tkinter as tk
@@ -31,8 +33,11 @@ SETTINGS_DIR = Path.home() / ".redshift"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 LOG_FILE = SETTINGS_DIR / "redshift.log"
 TABLE_SIZE = 256
-WINDOWS_REAPPLY_SECONDS = 5.0
+WINDOWS_REAPPLY_SECONDS = 2.0
 MACOS_REAPPLY_MS = 5000
+WINDOWS_MAGNIFICATION_START = 85
+DEFAULT_BRIGHTNESS = 100
+DISPLAY_REFRESH_MS = 2000
 
 
 if Foundation is not None:
@@ -46,6 +51,9 @@ if Foundation is not None:
 
         def sliderChanged_(self, sender: object) -> None:
             self.owner.set_intensity(int(round(sender.doubleValue())))
+
+        def brightnessSliderChanged_(self, sender: object) -> None:
+            self.owner.set_macos_brightness_from_slider(sender)
 
         def turnOff_(self, sender: object) -> None:
             self.owner.set_intensity(0)
@@ -66,10 +74,17 @@ def lerp(start: float, end: float, amount: float) -> float:
 
 def intensity_to_multipliers(value: int) -> tuple[float, float, float]:
     intensity = clamp(value / 100.0, 0.0, 1.0)
+    # Red stays at 1.0
     red_multiplier = 1.0
-    green_multiplier = 1.0 - intensity
-    blue_multiplier = max(0.0, 1.0 - intensity * 1.5)
+    # Green drops to 0 at 90% intensity to allow for pure red at the end
+    green_multiplier = clamp(1.0 - (intensity * 1.11), 0.0, 1.0)
+    # Blue drops to 0 at 50% intensity for a much faster redshift
+    blue_multiplier = clamp(1.0 - (intensity * 2.0), 0.0, 1.0)
     return red_multiplier, green_multiplier, blue_multiplier
+
+
+def brightness_to_multiplier(value: int) -> float:
+    return clamp(value / 100.0, 0.05, 1.0)
 
 
 class RedShiftApp:
@@ -79,13 +94,20 @@ class RedShiftApp:
         if not (self.is_macos or self.is_windows):
             raise RuntimeError(f"{APP_NAME} supports macOS and Windows only.")
 
-        self.intensity = self.load_intensity()
+        self.intensity, self.brightness = self.load_settings()
         self._quitting = False
         self._restored = False
         self._lock = threading.RLock()
+        self._main_thread = threading.current_thread()
+        self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self._windows_timer: threading.Timer | None = None
+        self._windows_foreground_hook = None
+        self._windows_foreground_callback = None
+        self._windows_magnification_initialized = False
+        self._windows_magnification_active = False
         self._macos_timer: threading.Timer | None = None
         self._last_macos_display_count: int | None = None
+        self._display_keys: tuple[str, ...] = ()
         self._ns_app = None
         self._macos_status_item = None
         self._macos_menu = None
@@ -93,13 +115,15 @@ class RedShiftApp:
         self._macos_status_label = None
         self._macos_percent_label = None
         self._macos_slider = None
+        self._macos_brightness_sliders = {}
+        self._macos_brightness_slider_keys = {}
         self._macos_turn_off_item = None
 
         self.root = None
         if not self.is_macos:
             self.root = tk.Tk()
             self.root.title(APP_NAME)
-            self.root.geometry("360x190")
+            self.root.geometry("390x310")
             self.root.resizable(False, False)
             self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
             self.root.wm_attributes("-topmost", True)
@@ -108,16 +132,21 @@ class RedShiftApp:
         self.status_var = tk.StringVar() if not self.is_macos else None
         self.percent_var = tk.StringVar() if not self.is_macos else None
         self.scale = None
+        self.brightness_group = None
+        self.brightness_sliders = {}
         self.status_label = None
         self.percent_label = None
         self.swatch = None
         self.icon: pystray.Icon | None = None
 
         self._init_platform()
+        self._start_windows_foreground_hook()
         if self.is_macos:
             self._build_macos_menu_bar()
         else:
             self._build_window()
+            self._schedule_ui_queue_drain()
+            self._schedule_display_refresh()
         self.apply_filter(self.intensity, persist=False, update_ui=True)
         if not self.is_macos:
             self._start_tray_thread()
@@ -164,6 +193,9 @@ class RedShiftApp:
         self.cg.CGDisplayRestoreColorSyncSettings.restype = None
 
     def _init_windows_gamma(self) -> None:
+        class MAGCOLOREFFECT(ctypes.Structure):
+            _fields_ = [("transform", ctypes.c_float * 25)]
+
         class DISPLAY_DEVICEW(ctypes.Structure):
             _fields_ = [
                 ("cb", ctypes.c_uint32),
@@ -175,9 +207,11 @@ class RedShiftApp:
             ]
 
         self.DISPLAY_DEVICEW = DISPLAY_DEVICEW
+        self.MAGCOLOREFFECT = MAGCOLOREFFECT
         self.DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
         self.user32 = ctypes.windll.user32
         self.gdi32 = ctypes.windll.gdi32
+        self.magnification = ctypes.WinDLL("Magnification.dll")
 
         self.user32.EnumDisplayDevicesW.argtypes = [
             ctypes.c_wchar_p,
@@ -197,6 +231,22 @@ class RedShiftApp:
         self.gdi32.SetDeviceGammaRamp.restype = ctypes.c_int
         self.gdi32.DeleteDC.argtypes = [ctypes.c_void_p]
         self.gdi32.DeleteDC.restype = ctypes.c_int
+        self.magnification.MagInitialize.argtypes = []
+        self.magnification.MagInitialize.restype = ctypes.c_int
+        self.magnification.MagUninitialize.argtypes = []
+        self.magnification.MagUninitialize.restype = ctypes.c_int
+        self.magnification.MagSetFullscreenTransform.argtypes = [
+            ctypes.c_float,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.magnification.MagSetFullscreenTransform.restype = ctypes.c_int
+        self.magnification.MagShowSystemCursor.argtypes = [ctypes.c_int]
+        self.magnification.MagShowSystemCursor.restype = ctypes.c_int
+        self.magnification.MagSetFullscreenColorEffect.argtypes = [
+            ctypes.POINTER(MAGCOLOREFFECT),
+        ]
+        self.magnification.MagSetFullscreenColorEffect.restype = ctypes.c_int
 
         class RECT(ctypes.Structure):
             _fields_ = [
@@ -237,6 +287,80 @@ class RedShiftApp:
             ctypes.POINTER(MONITORINFOEXW),
         ]
         self.user32.GetMonitorInfoW.restype = ctypes.c_int
+        self.user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        self.user32.GetSystemMetrics.restype = ctypes.c_int
+        self.user32.SetWindowPos.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        self.user32.SetWindowPos.restype = ctypes.c_int
+        self.user32.SetLayeredWindowAttributes.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_ubyte,
+            ctypes.c_uint32,
+        ]
+        self.user32.SetLayeredWindowAttributes.restype = ctypes.c_int
+        self.user32.SetWinEventHook.argtypes = [
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        self.user32.SetWinEventHook.restype = ctypes.c_void_p
+        self.user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
+        self.user32.UnhookWinEvent.restype = ctypes.c_int
+
+        self.SM_XVIRTUALSCREEN = 76
+        self.SM_YVIRTUALSCREEN = 77
+        self.SM_CXVIRTUALSCREEN = 78
+        self.SM_CYVIRTUALSCREEN = 79
+        self.GWL_EXSTYLE = -20
+        self.HWND_TOPMOST = -1
+        self.LWA_ALPHA = 0x00000002
+        self.SWP_NOACTIVATE = 0x0010
+        self.SWP_SHOWWINDOW = 0x0040
+        self.SWP_FRAMECHANGED = 0x0020
+        self.EVENT_SYSTEM_FOREGROUND = 0x0003
+        self.WINEVENT_OUTOFCONTEXT = 0x0000
+        self.WINEVENT_SKIPOWNPROCESS = 0x0002
+        self.WS_EX_TRANSPARENT = 0x00000020
+        self.WS_EX_TOOLWINDOW = 0x00000080
+        self.WS_EX_LAYERED = 0x00080000
+        self.WS_EX_NOACTIVATE = 0x08000000
+        self.WinEventProcType = ctypes.WINFUNCTYPE(
+            None,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.c_long,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        )
+
+        if ctypes.sizeof(ctypes.c_void_p) == ctypes.sizeof(ctypes.c_long):
+            self._get_window_long = self.user32.GetWindowLongW
+            self._set_window_long = self.user32.SetWindowLongW
+            window_long_type = ctypes.c_long
+            self._get_window_long.restype = ctypes.c_long
+            self._set_window_long.restype = ctypes.c_long
+        else:
+            self._get_window_long = self.user32.GetWindowLongPtrW
+            self._set_window_long = self.user32.SetWindowLongPtrW
+            window_long_type = ctypes.c_longlong
+            self._get_window_long.restype = ctypes.c_longlong
+            self._set_window_long.restype = ctypes.c_longlong
+        self._get_window_long.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._set_window_long.argtypes = [ctypes.c_void_p, ctypes.c_int, window_long_type]
 
     def _build_window(self) -> None:
         style = ttk.Style(self.root)
@@ -275,16 +399,98 @@ class RedShiftApp:
         self.scale.pack(fill=tk.X, pady=(18, 8))
         self.scale.set(self.intensity)
 
+        self.brightness_group = ttk.LabelFrame(outer, text="Brightness")
+        self.brightness_group.pack(fill=tk.X, pady=(8, 0))
+        self._rebuild_windows_brightness_controls()
+
         footer = ttk.Frame(outer)
         footer.pack(fill=tk.X, pady=(8, 0))
 
         self.status_label = ttk.Label(footer, textvariable=self.status_var, foreground="#6e6e73")
         self.status_label.pack(side=tk.LEFT)
 
+        if self.is_windows:
+            cursor_button = ttk.Button(footer, text="Cursor Setup", command=self.open_windows_cursor_settings)
+            cursor_button.pack(side=tk.RIGHT)
+
         turn_off_button = ttk.Button(footer, text="Turn Off", command=lambda: self.set_intensity(0))
         turn_off_button.pack(side=tk.RIGHT)
 
         self._update_window_ui()
+
+    def _rebuild_windows_brightness_controls(self) -> None:
+        if self.brightness_group is None:
+            return
+        for child in self.brightness_group.winfo_children():
+            child.destroy()
+        self.brightness_sliders = {}
+        display_options = self._display_options()
+        self._display_keys = tuple(key for key, _ in display_options)
+        if not display_options:
+            ttk.Label(self.brightness_group, text="No displays detected", foreground="#6e6e73").pack(
+                fill=tk.X,
+                padx=8,
+                pady=(6, 4),
+            )
+            return
+        for key, label in display_options:
+            row = ttk.Frame(self.brightness_group)
+            row.pack(fill=tk.X, padx=8, pady=(6, 4))
+            ttk.Label(row, text=label, width=12).pack(side=tk.LEFT)
+            slider = ttk.Scale(
+                row,
+                from_=5,
+                to=100,
+                orient=tk.HORIZONTAL,
+                length=210,
+                command=lambda raw_value, display_key=key: self._on_brightness_move(display_key, raw_value),
+            )
+            slider.set(self._brightness_for_display(key))
+            slider.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.brightness_sliders[key] = slider
+
+    def _schedule_display_refresh(self) -> None:
+        if self.root is None or self._quitting:
+            return
+        self.root.after(DISPLAY_REFRESH_MS, self._refresh_displays)
+
+    def _refresh_displays(self) -> None:
+        if self.root is None or self._quitting:
+            return
+        display_options = self._display_options()
+        display_keys = tuple(key for key, _ in display_options)
+        if display_keys != self._display_keys:
+            logging.info("Display list changed: %s", ", ".join(display_keys) if display_keys else "none")
+            self._rebuild_windows_brightness_controls()
+            self.apply_filter(self.intensity, persist=False, update_ui=True)
+        self._schedule_display_refresh()
+
+    def _call_on_ui(self, callback: Callable[[], None]) -> None:
+        if self.root is None or self._quitting:
+            return
+        if threading.current_thread() is self._main_thread:
+            callback()
+            return
+        self._ui_queue.put(callback)
+
+    def _schedule_ui_queue_drain(self) -> None:
+        if self.root is None or self._quitting:
+            return
+        self.root.after(50, self._drain_ui_queue)
+
+    def _drain_ui_queue(self) -> None:
+        if self.root is None or self._quitting:
+            return
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                logging.exception("Failed while running queued UI callback.")
+        self._schedule_ui_queue_drain()
 
     def _build_macos_menu_bar(self) -> None:
         self._configure_macos_app_mode()
@@ -316,6 +522,7 @@ class RedShiftApp:
         menu.addItem_(quit_item)
 
         self._macos_status_item.setMenu_(menu)
+        self._display_keys = tuple(key for key, _ in self._display_options())
 
     def _set_macos_status_icon(self) -> None:
         if self._macos_status_item is None:
@@ -337,22 +544,25 @@ class RedShiftApp:
 
     def _build_macos_controls_view(self) -> object:
         width = 286
-        height = 138
+        display_options = self._display_options()
+        brightness_height = max(1, len(display_options)) * 38
+        height = 154 + brightness_height
         view = AppKit.NSView.alloc().initWithFrame_(Foundation.NSMakeRect(0, 0, width, height))
+        top = height - 36
 
         title = AppKit.NSTextField.labelWithString_(APP_NAME)
-        title.setFrame_(Foundation.NSMakeRect(16, 102, 160, 22))
+        title.setFrame_(Foundation.NSMakeRect(16, top, 160, 22))
         title.setFont_(AppKit.NSFont.boldSystemFontOfSize_(15))
         view.addSubview_(title)
 
         subtitle = AppKit.NSTextField.labelWithString_("Display warmth")
-        subtitle.setFrame_(Foundation.NSMakeRect(16, 82, 160, 18))
+        subtitle.setFrame_(Foundation.NSMakeRect(16, top - 20, 160, 18))
         subtitle.setTextColor_(AppKit.NSColor.secondaryLabelColor())
         subtitle.setFont_(AppKit.NSFont.systemFontOfSize_(12))
         view.addSubview_(subtitle)
 
         self._macos_percent_label = AppKit.NSTextField.labelWithString_(self._format_intensity(self.intensity))
-        self._macos_percent_label.setFrame_(Foundation.NSMakeRect(210, 100, 58, 24))
+        self._macos_percent_label.setFrame_(Foundation.NSMakeRect(210, top - 2, 58, 24))
         self._macos_percent_label.setAlignment_(AppKit.NSTextAlignmentRight)
         self._macos_percent_label.setFont_(AppKit.NSFont.boldSystemFontOfSize_(15))
         view.addSubview_(self._macos_percent_label)
@@ -364,8 +574,37 @@ class RedShiftApp:
             self._macos_target,
             "sliderChanged:",
         )
-        self._macos_slider.setFrame_(Foundation.NSMakeRect(16, 48, 254, 24))
+        self._macos_slider.setFrame_(Foundation.NSMakeRect(16, top - 54, 254, 24))
         view.addSubview_(self._macos_slider)
+
+        brightness_title = AppKit.NSTextField.labelWithString_("Brightness")
+        brightness_title.setFrame_(Foundation.NSMakeRect(16, top - 82, 160, 18))
+        brightness_title.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+        brightness_title.setFont_(AppKit.NSFont.systemFontOfSize_(12))
+        view.addSubview_(brightness_title)
+
+        self._macos_brightness_sliders = {}
+        self._macos_brightness_slider_keys = {}
+        for index, (key, label_text) in enumerate(display_options):
+            y = top - 118 - (index * 38)
+            label = AppKit.NSTextField.labelWithString_(label_text)
+            label.setFrame_(Foundation.NSMakeRect(16, y + 18, 90, 16))
+            label.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+            label.setFont_(AppKit.NSFont.systemFontOfSize_(11))
+            view.addSubview_(label)
+
+            slider = AppKit.NSSlider.sliderWithValue_minValue_maxValue_target_action_(
+                float(self._brightness_for_display(key)),
+                5.0,
+                100.0,
+                self._macos_target,
+                "brightnessSliderChanged:",
+            )
+            slider.setTag_(index)
+            slider.setFrame_(Foundation.NSMakeRect(104, y + 12, 166, 24))
+            view.addSubview_(slider)
+            self._macos_brightness_sliders[key] = slider
+            self._macos_brightness_slider_keys[index] = key
 
         self._macos_status_label = AppKit.NSTextField.labelWithString_(self._format_window_status(self.intensity))
         self._macos_status_label.setFrame_(Foundation.NSMakeRect(16, 18, 160, 18))
@@ -380,6 +619,15 @@ class RedShiftApp:
 
         return view
 
+    def _rebuild_macos_menu_controls(self) -> None:
+        if self._macos_menu is None:
+            return
+        controls_item = self._macos_menu.itemAtIndex_(0)
+        if controls_item is not None:
+            controls_item.setView_(self._build_macos_controls_view())
+        self._display_keys = tuple(key for key, _ in self._display_options())
+        self._update_macos_menu_ui()
+
     def _start_tray_thread(self) -> None:
         thread = threading.Thread(target=self._run_tray_icon, name="redshift-tray", daemon=True)
         thread.start()
@@ -389,6 +637,7 @@ class RedShiftApp:
             pystray.MenuItem(lambda item: self._tray_status_text(), None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open Controls...", self._menu_adjust_filter, default=True),
+            pystray.MenuItem("Open Cursor Settings", self._menu_cursor_settings),
             pystray.MenuItem("Turn Off", self._menu_turn_off),
             pystray.MenuItem("Quit", self._menu_quit),
         )
@@ -404,8 +653,22 @@ class RedShiftApp:
     def _menu_turn_off(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self.root.after(0, lambda: self.set_intensity(0))
 
+    def _menu_cursor_settings(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        self.open_windows_cursor_settings()
+
     def _menu_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:
         self.root.after(0, self.quit_app)
+
+    def open_windows_cursor_settings(self) -> None:
+        if not self.is_windows:
+            return
+        try:
+            os.startfile("ms-settings:easeofaccess-mousepointer")
+        except OSError:
+            try:
+                os.startfile("ms-settings:easeofaccess-cursor")
+            except OSError:
+                logging.exception("Failed to open Windows cursor accessibility settings.")
 
     def _tray_status_text(self) -> str:
         return f"{APP_NAME}: {self._format_intensity(self.intensity)}"
@@ -465,12 +728,66 @@ class RedShiftApp:
             )
         return "#%02x%02x%02x" % rgb
 
+    def _display_options(self) -> list[tuple[str, str]]:
+        if self.is_macos:
+            displays = self._get_macos_displays()
+            return [(self._macos_display_key(display_id), f"Display {index + 1}") for index, display_id in enumerate(displays)]
+        if self.is_windows:
+            return [(name, self._windows_display_label(name, index)) for index, name in enumerate(self._get_windows_display_names())]
+        return []
+
+    def _macos_display_key(self, display_id: int) -> str:
+        return f"macos:{display_id}"
+
+    def _windows_display_label(self, device_name: str, index: int) -> str:
+        suffix = device_name.rsplit("\\", 1)[-1].replace(".", "")
+        return suffix or f"Display {index + 1}"
+
+    def _brightness_for_display(self, display_key: str) -> int:
+        try:
+            return int(clamp(int(self.brightness.get(display_key, DEFAULT_BRIGHTNESS)), 5, 100))
+        except (TypeError, ValueError):
+            return DEFAULT_BRIGHTNESS
+
+    def _set_display_brightness(self, display_key: str, value: int) -> None:
+        value = int(clamp(value, 5, 100))
+        if self._brightness_for_display(display_key) == value:
+            return
+        self.brightness[display_key] = value
+        self.apply_filter(self.intensity, persist=True, update_ui=True)
+
+    def set_macos_brightness_from_slider(self, sender: object) -> None:
+        key = self._macos_brightness_slider_keys.get(int(sender.tag()))
+        if key is None:
+            return
+        self._set_display_brightness(key, int(round(sender.doubleValue())))
+
     def _on_slider_move(self, raw_value: str) -> None:
         try:
             value = int(float(raw_value))
         except ValueError:
             return
-        self.set_intensity(value)
+
+        if hasattr(self, "_slider_after_id") and self._slider_after_id:
+            self.root.after_cancel(self._slider_after_id)
+
+        self._slider_after_id = self.root.after(100, lambda: self.set_intensity(value))
+
+    def _on_brightness_move(self, display_key: str, raw_value: str) -> None:
+        try:
+            value = int(float(raw_value))
+        except ValueError:
+            return
+
+        after_id_name = f"_brightness_after_id_{display_key}"
+        existing_after_id = getattr(self, after_id_name, None)
+        if existing_after_id:
+            self.root.after_cancel(existing_after_id)
+        setattr(
+            self,
+            after_id_name,
+            self.root.after(100, lambda: self._set_display_brightness(display_key, value)),
+        )
 
     def set_intensity(self, value: int) -> None:
         value = int(clamp(value, 0, 100))
@@ -485,13 +802,15 @@ class RedShiftApp:
     def apply_filter(self, value: int, persist: bool = True, update_ui: bool = True) -> None:
         with self._lock:
             if value <= 0:
+                logging.info("Restoring normal colors (intensity 0)")
                 self._restore_platform_gamma()
             else:
+                logging.info("Applying filter (intensity %d%%)", value)
                 red_multiplier, green_multiplier, blue_multiplier = intensity_to_multipliers(value)
                 self._apply_platform_gamma(red_multiplier, green_multiplier, blue_multiplier, value)
 
             if persist:
-                self.save_intensity(value)
+                self.save_settings()
 
             if update_ui:
                 self._update_window_ui()
@@ -513,6 +832,7 @@ class RedShiftApp:
         if self.is_macos:
             self.cg.CGDisplayRestoreColorSyncSettings()
         elif self.is_windows:
+            self._restore_windows_magnification_effect()
             self._restore_windows_gamma()
 
     def _get_macos_displays(self) -> List[int]:
@@ -539,19 +859,20 @@ class RedShiftApp:
         return display_ids
 
     def _apply_macos_gamma(self, red_multiplier: float, green_multiplier: float, blue_multiplier: float) -> None:
-        red_table = [i / 255.0 * red_multiplier for i in range(TABLE_SIZE)]
-        green_table = [i / 255.0 * green_multiplier for i in range(TABLE_SIZE)]
-        blue_table = [i / 255.0 * blue_multiplier for i in range(TABLE_SIZE)]
-
-        red_array = (ctypes.c_float * TABLE_SIZE)(*red_table)
-        green_array = (ctypes.c_float * TABLE_SIZE)(*green_table)
-        blue_array = (ctypes.c_float * TABLE_SIZE)(*blue_table)
-
         displays = self._get_macos_displays()
         if not displays:
             logging.warning("No macOS displays found while applying gamma table.")
 
         for display_id in displays:
+            brightness = brightness_to_multiplier(self._brightness_for_display(self._macos_display_key(display_id)))
+            red_table = [i / 255.0 * red_multiplier * brightness for i in range(TABLE_SIZE)]
+            green_table = [i / 255.0 * green_multiplier * brightness for i in range(TABLE_SIZE)]
+            blue_table = [i / 255.0 * blue_multiplier * brightness for i in range(TABLE_SIZE)]
+
+            red_array = (ctypes.c_float * TABLE_SIZE)(*red_table)
+            green_array = (ctypes.c_float * TABLE_SIZE)(*green_table)
+            blue_array = (ctypes.c_float * TABLE_SIZE)(*blue_table)
+
             error = self.cg.CGSetDisplayTransferByTable(
                 ctypes.c_uint32(display_id),
                 ctypes.c_uint32(TABLE_SIZE),
@@ -613,27 +934,85 @@ class RedShiftApp:
             logging.warning("No Windows displays found while enumerating gamma ramp targets.")
         return names
 
-    def _build_windows_ramp(self, multiplier: float, value: int) -> List[int]:
+    def _build_windows_ramp(self, multiplier: float, value: int, brightness: float) -> List[int]:
+        safe_multiplier = max(0.015, multiplier)
         values: List[int] = []
-        min_multiplier = 10.0 / 255.0
-
-        if value >= 100 and multiplier <= 0.0:
-            return [0] * TABLE_SIZE
-
-        effective_multiplier = multiplier
-        if 0 < value < 100 and multiplier < min_multiplier:
-            effective_multiplier = min_multiplier
-
         for index in range(TABLE_SIZE):
             level = index / 255.0
-            word_value = int(clamp(level * effective_multiplier, 0.0, 1.0) * 65535.0)
-            if 0 < value < 100 and word_value < 256:
-                word_value = 256
+            word_value = int(level * safe_multiplier * brightness * 65535.0)
             values.append(clamp(word_value, 0, 65535))
-
-        if value >= 100 and multiplier <= 0.0:
-            values[0] = 0
         return [int(v) for v in values]
+
+    def _windows_magnification_effect(self, value: int) -> object:
+        amount = clamp(
+            (value - WINDOWS_MAGNIFICATION_START) / (100 - WINDOWS_MAGNIFICATION_START),
+            0.0,
+            1.0,
+        )
+        amount = amount * amount * (3.0 - (2.0 * amount))
+        identity = [
+            1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+        red_luminance = [
+            0.30, 0.0, 0.0, 0.0, 0.0,
+            0.59, 0.0, 0.0, 0.0, 0.0,
+            0.11, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0,
+        ]
+        values = [
+            lerp(identity[index], red_luminance[index], amount)
+            for index in range(25)
+        ]
+        return self.MAGCOLOREFFECT((ctypes.c_float * 25)(*values))
+
+    def _apply_windows_magnification_effect(self, value: int) -> bool:
+        if value < WINDOWS_MAGNIFICATION_START:
+            self._restore_windows_magnification_effect()
+            return False
+        if not self._windows_magnification_initialized:
+            if not self.magnification.MagInitialize():
+                logging.warning("Failed to initialize Windows Magnification API.")
+                return False
+            self._windows_magnification_initialized = True
+        self.magnification.MagSetFullscreenTransform(1.0, 0, 0)
+        self.magnification.MagShowSystemCursor(1)
+        effect = self._windows_magnification_effect(value)
+        if not self.magnification.MagSetFullscreenColorEffect(ctypes.byref(effect)):
+            logging.warning("Failed to apply Windows Magnification color effect.")
+            return False
+        self._windows_magnification_active = True
+        return True
+
+    def _restore_windows_magnification_effect(self) -> None:
+        if not self._windows_magnification_initialized:
+            return
+        effect = self.MAGCOLOREFFECT((ctypes.c_float * 25)(
+            1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0,
+        ))
+        try:
+            self.magnification.MagSetFullscreenColorEffect(ctypes.byref(effect))
+        except Exception:
+            pass
+        self._windows_magnification_active = False
+
+    def _uninitialize_windows_magnification(self) -> None:
+        if not self._windows_magnification_initialized:
+            return
+        self._restore_windows_magnification_effect()
+        try:
+            self.magnification.MagUninitialize()
+        except Exception:
+            pass
+        self._windows_magnification_initialized = False
 
     def _apply_windows_gamma(
         self,
@@ -642,17 +1021,22 @@ class RedShiftApp:
         blue_multiplier: float,
         value: int,
     ) -> None:
-        red_values = [int((i / 255.0) * 65535.0) for i in range(TABLE_SIZE)]
-        green_values = self._build_windows_ramp(green_multiplier, value)
-        blue_values = self._build_windows_ramp(blue_multiplier, value)
-
-        ramp = (ctypes.c_ushort * (TABLE_SIZE * 3))()
-        for index in range(TABLE_SIZE):
-            ramp[index] = red_values[index]
-            ramp[TABLE_SIZE + index] = green_values[index]
-            ramp[TABLE_SIZE * 2 + index] = blue_values[index]
-
+        self._apply_windows_magnification_effect(value)
+        if value >= WINDOWS_MAGNIFICATION_START:
+            green_multiplier = 1.0
+            blue_multiplier = 1.0
         for device_name in self._get_windows_display_names():
+            brightness = brightness_to_multiplier(self._brightness_for_display(device_name))
+            red_values = [int((i / 255.0) * brightness * 65535.0) for i in range(TABLE_SIZE)]
+            green_values = self._build_windows_ramp(green_multiplier, value, brightness)
+            blue_values = self._build_windows_ramp(blue_multiplier, value, brightness)
+
+            ramp = (ctypes.c_ushort * (TABLE_SIZE * 3))()
+            for index in range(TABLE_SIZE):
+                ramp[index] = red_values[index]
+                ramp[TABLE_SIZE + index] = green_values[index]
+                ramp[TABLE_SIZE * 2 + index] = blue_values[index]
+
             hdc = self._create_windows_display_dc(device_name)
             if not hdc:
                 logging.warning("Failed to create Windows display DC for %s.", device_name)
@@ -661,7 +1045,6 @@ class RedShiftApp:
                 result = self.gdi32.SetDeviceGammaRamp(hdc, ctypes.byref(ramp))
                 if not result:
                     logging.warning("Failed to apply gamma ramp to Windows display %s.", device_name)
-                    self._restore_windows_gamma_for_device(device_name)
             finally:
                 self.gdi32.DeleteDC(hdc)
 
@@ -699,6 +1082,47 @@ class RedShiftApp:
                 return int(hdc)
         return 0
 
+    def _start_windows_foreground_hook(self) -> None:
+        if not self.is_windows:
+            return
+
+        def _callback(
+            hook: ctypes.c_void_p,
+            event: int,
+            hwnd: ctypes.c_void_p,
+            object_id: int,
+            child_id: int,
+            event_thread: int,
+            event_time: int,
+        ) -> None:
+            del hook, event, hwnd, object_id, child_id, event_thread, event_time
+            if self._quitting or self.intensity <= 0:
+                return
+            self._call_on_ui(self._reapply_windows_filter)
+
+        self._windows_foreground_callback = self.WinEventProcType(_callback)
+        self._windows_foreground_hook = self.user32.SetWinEventHook(
+            self.EVENT_SYSTEM_FOREGROUND,
+            self.EVENT_SYSTEM_FOREGROUND,
+            None,
+            self._windows_foreground_callback,
+            0,
+            0,
+            self.WINEVENT_OUTOFCONTEXT | self.WINEVENT_SKIPOWNPROCESS,
+        )
+        if not self._windows_foreground_hook:
+            logging.warning("Failed to install Windows foreground event hook.")
+
+    def _stop_windows_foreground_hook(self) -> None:
+        hook = self._windows_foreground_hook
+        self._windows_foreground_hook = None
+        self._windows_foreground_callback = None
+        if hook:
+            try:
+                self.user32.UnhookWinEvent(hook)
+            except Exception:
+                pass
+
     def _schedule_windows_reapply(self) -> None:
         if not self.is_windows or self._quitting:
             return
@@ -707,10 +1131,7 @@ class RedShiftApp:
             if self._quitting:
                 return
             if self.intensity > 0:
-                try:
-                    self.apply_filter(self.intensity, persist=False, update_ui=False)
-                finally:
-                    self._update_tray_ui()
+                self._call_on_ui(self._reapply_windows_filter)
             self._schedule_windows_reapply()
 
         self._windows_timer = threading.Timer(WINDOWS_REAPPLY_SECONDS, _tick)
@@ -723,6 +1144,16 @@ class RedShiftApp:
         if timer is not None:
             timer.cancel()
 
+    def _reapply_windows_filter(self) -> None:
+        if self._quitting or self.intensity <= 0:
+            return
+        try:
+            self.apply_filter(self.intensity, persist=False, update_ui=False)
+        except Exception:
+            logging.exception("Failed to reapply Windows filter.")
+        finally:
+            self._update_tray_ui()
+
     def _schedule_macos_reapply(self) -> None:
         if not self.is_macos or self._quitting:
             return
@@ -730,6 +1161,11 @@ class RedShiftApp:
         def _tick() -> None:
             if self._quitting:
                 return
+            display_options = self._display_options()
+            display_keys = tuple(key for key, _ in display_options)
+            if display_keys != self._display_keys:
+                logging.info("macOS display list changed: %s", ", ".join(display_keys) if display_keys else "none")
+                self._rebuild_macos_menu_controls()
             if self.intensity > 0:
                 self.apply_filter(self.intensity, persist=False, update_ui=False)
             self._schedule_macos_reapply()
@@ -756,6 +1192,9 @@ class RedShiftApp:
         if self.swatch is not None:
             self.swatch.delete("all")
             self.swatch.create_oval(2, 2, 26, 26, fill=color, outline="#d2d2d7")
+        for key, slider in self.brightness_sliders.items():
+            if int(float(slider.get())) != self._brightness_for_display(key):
+                slider.set(self._brightness_for_display(key))
         self.percent_var.set(self._format_intensity(self.intensity))
         self.status_var.set(self._format_window_status(self.intensity))
 
@@ -771,6 +1210,10 @@ class RedShiftApp:
             self._macos_status_label.setStringValue_(self._format_window_status(self.intensity))
         if self._macos_slider is not None and int(round(self._macos_slider.doubleValue())) != self.intensity:
             self._macos_slider.setDoubleValue_(float(self.intensity))
+        for key, slider in self._macos_brightness_sliders.items():
+            brightness = self._brightness_for_display(key)
+            if int(round(slider.doubleValue())) != brightness:
+                slider.setDoubleValue_(float(brightness))
         if self._macos_turn_off_item is not None:
             self._macos_turn_off_item.setEnabled_(self.intensity > 0)
 
@@ -803,24 +1246,34 @@ class RedShiftApp:
         if self.root is None:
             return
         self.root.update_idletasks()
-        width = 360
-        height = 190
+        width = 390
+        height = 310
         screen_width = self.root.winfo_screenwidth()
         x = max(16, screen_width - width - 18)
         y = 34 if self.is_macos else 80
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
-    def load_intensity(self) -> int:
+    def load_settings(self) -> tuple[int, dict[str, int]]:
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            return int(clamp(int(data.get("intensity", 0)), 0, 100))
+            brightness = data.get("brightness", {})
+            if not isinstance(brightness, dict):
+                brightness = {}
+            cleaned_brightness = {
+                str(key): int(clamp(int(value), 5, 100))
+                for key, value in brightness.items()
+            }
+            return int(clamp(int(data.get("intensity", 0)), 0, 100)), cleaned_brightness
         except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError, TypeError):
-            return 0
+            return 0, {}
 
-    def save_intensity(self, value: int) -> None:
+    def save_settings(self) -> None:
         try:
             SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-            SETTINGS_FILE.write_text(json.dumps({"intensity": value}), encoding="utf-8")
+            SETTINGS_FILE.write_text(
+                json.dumps({"intensity": self.intensity, "brightness": self.brightness}, indent=2),
+                encoding="utf-8",
+            )
         except OSError:
             pass
 
@@ -838,7 +1291,10 @@ class RedShiftApp:
             return
         self._cancel_windows_reapply()
         self._cancel_macos_reapply()
+        self._stop_windows_foreground_hook()
         self._restore_on_exit()
+        if self.is_windows:
+            self._uninitialize_windows_magnification()
         self._quitting = True
 
         icon = self.icon
@@ -885,6 +1341,9 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
+    if sys.platform.startswith("win") and "--cursor-settings" in sys.argv:
+        os.startfile("ms-settings:easeofaccess-mousepointer")
+        return
     app = RedShiftApp()
     app.run()
 
